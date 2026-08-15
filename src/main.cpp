@@ -5,7 +5,7 @@
 #include <ArduinoMqttClient.h>
 #include <WiFiNINA.h>
 #include <ArduinoLog.h>
-#include <Arduino_Json.h>
+#include <Arduino_JSON.h>
 #include "SerialTransfer.h"
 
 #include "logger.h" 
@@ -34,12 +34,20 @@
 #define DEFAULT_CHARACTER ' '
 #define AWS_MQTT_KEEPALIVE_INTERVAL 5 * 60 * 1000L
 #define AWS_MQTT_CONNECTION_TIMEOUT 60 * 1000L
+#define AWS_MQTT_HEALTH_CHECK_INTERVAL 60 * 1000L   // probe liveness more often than the keep-alive
+#define AWS_MQTT_INACTIVITY_TIMEOUT 3 * 60 * 1000L  // force a reconnect if nothing's been heard this long
 /*****************************/
 
 SerialTransfer wireData;             // controller to worker communication
 WiFiClient wifiClient;               // MQTT TCP
 BearSSLClient sslClient(wifiClient); // MQTT SSL
 MqttClient mqttClient(sslClient);    // MQTT client
+
+// Tracks real MQTT traffic so we can detect a connection that's gone stale
+// (e.g. router NAT silently dropping the idle TCP session) even though
+// WiFi.status() and mqttClient.connected() both still claim everything's fine.
+unsigned long lastMessageMillis = 0;
+unsigned long lastHealthCheckMillis = 0;
 
 typedef struct MQTTDesiredState
 {
@@ -240,6 +248,8 @@ void publishReportedStateMessage(struct MQTTDesiredState *desired)
 
 void onMQTTMessage(int messageSize)
 {
+  lastMessageMillis = millis();
+
   String topic = mqttClient.messageTopic();
   Log.infoln("Received message on topic \"%s\" with size %d bytes", topic.c_str(), messageSize);
 
@@ -309,6 +319,9 @@ void connectMQTT()
   delay(100);
 
   requestDesiredState();
+
+  lastMessageMillis = millis();
+  lastHealthCheckMillis = millis();
 }
 
 unsigned long getTime()
@@ -344,14 +357,32 @@ void loop()
     connectWiFi();
   }
 
-  if (!mqttClient.connected())
+  // A dead/NAT-dropped MQTT session can leave mqttClient.connected() reporting
+  // true forever, since nothing ever tells the socket the remote end is gone.
+  // Don't trust it alone - force a reconnect if we've heard nothing in too long.
+  bool mqttStale = mqttClient.connected() && (millis() - lastMessageMillis > AWS_MQTT_INACTIVITY_TIMEOUT);
+
+  if (!mqttClient.connected() || mqttStale)
   {
+    if (mqttStale)
+    {
+      Log.warningln("No MQTT activity in over %lu ms, forcing reconnect", (unsigned long)(millis() - lastMessageMillis));
+      mqttClient.stop();
+    }
     digitalWrite(LED_BUILTIN, HIGH); // light ON if NOT connected to MQTT
     connectMQTT();
   }
 
   // poll for new MQTT messages and send keep-alive
   mqttClient.poll();
+
+  // Actively probe liveness far more often than the 5-minute keep-alive so a
+  // stale connection gets caught in ~1 minute instead of potentially never.
+  if (millis() - lastHealthCheckMillis > AWS_MQTT_HEALTH_CHECK_INTERVAL)
+  {
+    requestDesiredState();
+    lastHealthCheckMillis = millis();
+  }
 
   delay(500);
   digitalWrite(LED_BUILTIN, HIGH);
