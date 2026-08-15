@@ -5,7 +5,7 @@
 #include <ArduinoMqttClient.h>
 #include <WiFiNINA.h>
 #include <ArduinoLog.h>
-#include <Arduino_Json.h>
+#include <Arduino_JSON.h>
 #include "SerialTransfer.h"
 
 #include "logger.h" 
